@@ -1,0 +1,422 @@
+% MATLAB script for multi-pitch analysis and tonic estimation with note mapping, GPU accelerated and multithreaded
+% with tonic estimation on GPU and corrected for parfor/spmd
+
+% 1. Load Audio File
+audioFilePath = 'kal.mp3';  % Replace with the actual path
+fprintf('Executing: Loading audio file\n'); % Print statement
+[y, sr] = audioread(audioFilePath);           % y: audio data, sr: sampling rate
+
+% 2. Limit to 30 Seconds
+analysis_duration = 10; % seconds
+y = y(1:min(length(y), sr * analysis_duration)); % Truncate audio
+fprintf('Executing: Limiting audio to 30 seconds\n'); % Print statement
+
+% 2. Parameters
+frameLength = 2048;   % Length of each analysis frame (samples)
+hopLength   = 512;    % Hop size between frames (samples)
+fmin = 50;  % Minimum frequency to consider (Hz) - adjust as needed
+fmax = 800; % Maximum frequency to consider (Hz) - adjust as needed
+numHarmonics = 5; % Number of harmonics to consider for multi-pitch detection
+fftLength = 2048; % Length for FFT (needs to be power of 2)
+
+% 3. Note Mapping Parameters (initial A4 assumption)
+A4 = 440.0;
+A4_INDEX = 57;
+notes = {
+    "C0","C#0","D0","D#0","E0","F0","F#0","G0","G#0","A0","A#0","B0",
+    "C1","C#1","D1","D#1","E1","F1","F#1","G1","G#1","A1","A#1","B1",
+    "C2","C#2","D2","D#2","E2","F2","F#2","G2","G#2","A2","A#2","B2",
+    "C3","C#3","D3","D#3","E3","F3","F#3","G3","G#3","A3","A#3","B3",
+    "C4","C#4","D4","D#4","E4","F4","F#4","G4","G#4","A4","A#4","B4",
+    "C5","C#5","D5","D#5","E5","F5","F#5","G5","G#5","A5","A#5","B5",
+    "C6","C#6","D6","D#6","E6","F6","F#6","G6","G#6","A6","A#6","B6",
+    "C7","C#7","D7","D#7","E7","F7","F#7","G7","G#7","A7","A#7","B7",
+    "C8","C#8","D8","D#8","E8","F8","F#8","G8","G#8","A8","A#8","B8",
+    "C9","C#9","D9","D#9","E9","F9","F#9","G9","G#9","A9","A#9","B9"
+    };
+
+% 4. Multi-Pitch Analysis - GPU Accelerated and Parallelized
+numFrames = floor((length(y) - frameLength) / hopLength) + 1; % Number of frames
+fprintf('Multi-Pitch Analysis: Number of frames = %d\n', numFrames); % Print statement
+
+% Preallocate GPU arrays
+estimatedFrequencies = zeros(numFrames, numHarmonics, 'gpuArray'); %Store estimated frequencies of harmonics
+confidenceScores = zeros(numFrames, numHarmonics, 'gpuArray');      %Store confidence of each harmonic
+noteIndices = zeros(numFrames, numHarmonics, 'gpuArray');  %Store note index directly to convert back to cell strings later
+
+% Prepare data for GPU
+y_gpu = gpuArray(y);
+window = gpuArray(hann(frameLength));
+f = gpuArray(sr * (0:(fftLength/2)) / fftLength);  % frequency axis, adjusted for fftLength
+numNotes = length(notes); %store to prevent multiple calls
+
+% Precompute harmonic indices on GPU for reuse
+harmonic_indices = gpuArray((1:numHarmonics)); % Harmonic indices on the GPU
+
+spmd % Start parallel pool for data parallelism
+    local_estimatedFrequencies = zeros(numFrames, numHarmonics, 'gpuArray');
+    local_confidenceScores = zeros(numFrames, numHarmonics, 'gpuArray');
+    local_noteIndices = zeros(numFrames, numHarmonics, 'gpuArray');
+
+    fprintf('SPMD Block - Lab %d: Starting frame analysis\n', labindex); % Print statement
+
+    % Allocate frame buffer once outside the loop to reduce memory allocation overhead
+    frame = gpuArray(zeros(frameLength, 1)); % Initialize frame buffer
+
+    for i = labindex:numlabs:numFrames % Distribute frames across labs
+        startIndex = (i - 1) * hopLength + 1;
+        endIndex   = startIndex + frameLength - 1;
+
+        % Load frame directly into pre-allocated frame buffer to prevent memory allocation in the loop
+        frame(1:frameLength) = y_gpu(startIndex:endIndex);
+
+        % Windowing
+        windowedFrame  = frame .* window;
+
+        % Compute the Spectrum (FFT) - Using short FFT
+        fft_frame = fft(windowedFrame, fftLength);
+        P2 = abs(fft_frame/fftLength);
+        P1 = P2(1:fftLength/2+1);
+        P1(2:end-1) = 2*P1(2:end-1);
+
+        % Harmonic Product Spectrum (HPS) inspired
+        hps_spectrum = P1;
+        for h = 2:numHarmonics
+            downsampled_indices = 1:h:length(P1);  % downsample indices
+            if (length(downsampled_indices) > length(hps_spectrum))
+                downsampled_indices = downsampled_indices(1:length(hps_spectrum));
+            elseif (length(downsampled_indices) < length(hps_spectrum))
+                hps_spectrum = hps_spectrum(1:length(downsampled_indices));
+            end
+
+            hps_spectrum = hps_spectrum .* P1(downsampled_indices);
+        end
+
+        % Estimate the Fundamental Frequency (F0)
+        [peak_value, peak_index] = max(hps_spectrum);
+        estimatedF0 = f(peak_index);  % in Hz
+
+        %Task Parallelism using arrayfun and a GPU function
+        fprintf('SPMD Block - Lab %d: Executing analyzeHarmonics for frame %d\n', labindex, i); % Print statement
+        [local_estimatedFrequencies(i,:), local_confidenceScores(i,:), local_noteIndices(i,:)] = ...
+            analyzeHarmonics(estimatedF0, f, P1, A4, A4_INDEX, numNotes, harmonic_indices);
+
+    end
+
+    estimatedFrequencies = local_estimatedFrequencies;
+    confidenceScores = local_confidenceScores;
+    noteIndices = local_noteIndices;
+    fprintf('SPMD Block - Lab %d: Finished frame analysis\n', labindex); % Print statement
+
+end
+
+estimatedFrequencies = gather(estimatedFrequencies);
+confidenceScores = gather(confidenceScores);
+noteIndices = gather(noteIndices);
+
+noteNames = cell(numFrames, numHarmonics);
+for i = 1:numFrames
+    for h = 1:numHarmonics
+        noteIndex = noteIndices(i,h);
+        if(noteIndex >= 1 && noteIndex <= length(notes))
+            noteNames{i,h} = notes{noteIndex};
+        else
+            noteNames{i,h} = "N/A";
+        end
+    end
+end
+
+noteNames = string(noteNames);
+
+% 5. Tonic Estimation (GPU Accelerated)
+fprintf('Executing: Tonic Estimation\n'); % Print statement
+frequency_weights = mean(confidenceScores ./ sum(confidenceScores, 2), 1);  % Normalize the power for each frame so that total is 1, then take the mean across all frames for each Harmonic
+weighted_frequencies = estimatedFrequencies .* frequency_weights;
+
+% Histogram Analysis to find prominent peaks (on GPU)
+numBins = 50;
+
+[N,edges] = histcounts(gather(weighted_frequencies(:)), numBins); % Generate histcounts on CPU since no gpu version exist
+
+%Move to gpu
+N = gpuArray(N);
+edges = gpuArray(edges);
+
+%Find peaks (GPU)
+minPeakDistance = 5;
+fprintf('Executing: findpeaks_gpu\n'); % Print statement
+[peaks,peakLocations] = findpeaks_gpu(N, minPeakDistance); % Custom GPU peak finding
+
+% Convert peak locations to frequency values
+peakFrequencies = edges(peakLocations);
+
+%If peak frequencies are empty, use the mean to estimate tonic
+if isempty(peakFrequencies)
+    tonicEstimate = mean(weighted_frequencies(:));
+    fprintf('No prominent peaks found. Using mean frequency: %.2f Hz\n', tonicEstimate);
+else
+    [~, maxPeakIndex] = max(peaks);
+    tonicEstimate = peakFrequencies(maxPeakIndex);  % Find the frequency with the most prominent peak
+    fprintf('Prominent Peak found. Tonic Estimated from largest peak in distribution : %.2f Hz\n', tonicEstimate);
+
+end
+
+tonicEstimate = gather(tonicEstimate); % get value back from GPU
+peakFrequencies = gather(peakFrequencies);
+
+% Find note name of tonic Estimate
+fprintf('Executing: frequencyToNote\n'); % Print statement
+tonicNoteName = frequencyToNote(tonicEstimate, A4, A4_INDEX, notes);
+
+%Redefine A4 based on tonic estimation.
+A4 = tonicEstimate;
+A4_INDEX = frequencyToNoteIndex(A4,A4, A4_INDEX, numNotes);
+
+fprintf("Estimated Tonic Note: %s\n", tonicNoteName);
+
+% Re-calculate note indices with the correct tonic
+estimatedFrequencies_gpu = gpuArray(estimatedFrequencies);
+noteIndices_corrected = zeros(numFrames, numHarmonics, 'gpuArray');
+for i = 1:numFrames
+    for h = 1:numHarmonics
+         noteIndices_corrected(i, h) = frequencyToNoteIndex(estimatedFrequencies_gpu(i,h), A4, A4_INDEX, numNotes);
+    end
+end
+
+noteIndices_corrected = gather(noteIndices_corrected);
+
+
+noteNames_corrected = cell(numFrames, numHarmonics);
+for i = 1:numFrames
+    for h = 1:numHarmonics
+        noteIndex = noteIndices_corrected(i,h);
+        if(noteIndex >= 1 && noteIndex <= length(notes))
+            noteNames_corrected{i,h} = notes{noteIndex};
+        else
+            noteNames_corrected{i,h} = "N/A";
+        end
+    end
+end
+noteNames_corrected = string(noteNames_corrected);
+
+% 6. Visualization
+fprintf('Executing: Visualization\n'); % Print statement
+
+%Time Axis
+timeAxis = (0:numFrames-1) * hopLength / sr;
+
+figure;
+
+% Subplot 1: Spectrogram
+subplot(3, 1, 1);
+spectrogram(y, hamming(frameLength), hopLength, fftLength, sr, 'yaxis'); %Use same FFT Length used to generate the data
+title('Spectrogram of the Audio');
+colorbar;
+
+% Subplot 2: Multi-pitch over time
+subplot(3, 1, 2);
+hold on;
+for harmonic = 1:numHarmonics
+    plot(timeAxis, estimatedFrequencies(:, harmonic), 'DisplayName', sprintf('Harmonic %d', harmonic));
+end
+hold off;
+xlabel('Time (s)');
+ylabel('Frequency (Hz)');
+title('Estimated Frequencies over Time');
+legend show;
+ylim([fmin, fmax*numHarmonics]);
+
+% Subplot 3: Histogram of Estimated Frequencies and Tonic
+subplot(3, 1, 3);
+histogram(gather(weighted_frequencies(:)), gather(edges)); %Use the edges to make both histograms consistent.
+hold on;
+xline(tonicEstimate, 'r', 'LineWidth', 2, 'DisplayName', sprintf('Tonic Estimate: %.2f Hz (%s)', tonicEstimate, tonicNoteName));
+xline(peakFrequencies, 'g', 'LineWidth', 1, 'DisplayName', sprintf('Peaks from distribution: %.2f Hz', peakFrequencies));
+hold off;
+xlabel('Frequency (Hz)');
+ylabel('Count');
+title('Histogram of Estimated Frequencies and Prominent Peaks');
+legend show;
+
+sgtitle('Multi-Pitch Analysis and Tonic Estimation');
+
+% ---- Helper Function: frequencyToNote -----
+function noteName = frequencyToNote(inputFrequency, A4, A4_INDEX, notes)
+    % Converts a frequency to the nearest note name, similar to the JavaScript code.
+    % inputFrequency: Frequency in Hz.
+    % inputFrequency: Frequency in Hz.
+    % A4: Frequency of A4 (440 Hz).
+    % A4_INDEX: Index of A4 in the 'notes' cell array.
+    % notes: Cell array of note names.
+
+    MINUS = 0;
+    PLUS = 1;
+
+    frequency = A4;
+    r = 2^(1/12);  % Semitone ratio
+    cent = 2^(1/1200); % Cent ratio
+
+    r_index = 0;
+    cent_index = 0;
+    side = 0;
+
+    if inputFrequency >= frequency
+        while inputFrequency >= r * frequency
+            frequency = r * frequency;
+            r_index = r_index + 1;
+        end
+        while inputFrequency > cent * frequency
+            frequency = cent * frequency;
+            cent_index = cent_index + 1;
+        end
+
+        if (cent * frequency - inputFrequency) < (inputFrequency - frequency)
+            cent_index = cent_index + 1;
+        end
+
+        if cent_index > 50
+            r_index = r_index + 1;
+            cent_index = 100 - cent_index;
+            if cent_index ~= 0
+                side = MINUS;
+            else
+                side = PLUS;
+            end
+        else
+            side = PLUS;
+        end
+    else
+        while inputFrequency <= frequency / r
+            frequency = frequency / r;
+            r_index = r_index - 1;
+        end
+        while inputFrequency < frequency / cent
+            frequency = frequency / cent;
+            cent_index = cent_index + 1;
+        end
+
+        if (inputFrequency - frequency/cent) < (inputFrequency - frequency)
+            cent_index = cent_index + 1;
+        end
+
+        if cent_index >= 50
+            r_index = r_index - 1;
+            cent_index = 100 - cent_index;
+            side = PLUS;
+        else
+            if cent_index ~= 0
+                side = MINUS;
+            else
+                side = PLUS;
+            end
+        end
+    end
+
+    % Get the note
+    noteIndex = A4_INDEX + r_index;
+
+    % Check index bounds (IMPORTANT: Prevent errors)
+    if noteIndex < 1
+        noteIndex = 1;
+    elseif noteIndex > length(notes)
+        noteIndex = length(notes);
+    end
+
+    result = notes{noteIndex}; % Use curly braces for cell array indexing
+
+    % Append cents value
+    if side == PLUS
+        result = result + " + " + cent_index + " cents";
+    else
+        result = result + " - " + cent_index + " cents";
+    end
+    noteName = result;
+end
+
+function noteIndex = frequencyToNoteIndex(inputFrequency, A4, A4_INDEX, numNotes)
+    % Converts a frequency to the nearest note index.
+
+    frequency = A4;
+    r = 2^(1/12);  % Semitone ratio
+
+    r_index = 0;
+
+    if inputFrequency >= frequency
+        while inputFrequency >= r * frequency
+            frequency = r * frequency;
+            r_index = r_index + 1;
+        end
+    else
+        while inputFrequency <= frequency / r
+            frequency = frequency / r;
+            r_index = r_index - 1;
+        end
+    end
+
+    noteIndex = A4_INDEX + r_index;
+
+    % Check index bounds (IMPORTANT: Prevent errors)
+    if noteIndex < 1
+        noteIndex = 1;
+    elseif noteIndex > numNotes
+        noteIndex = numNotes;
+    end
+end
+
+function [peaks, peakLocations] = findpeaks_gpu(data, minPeakDistance)
+    %Finds peaks in GPU array data. Returns peaks and their locations.
+
+    data_size = size(data);
+    data_length = data_size(2);
+
+    peakLocations = gpuArray(zeros(1,0,'int32'));
+    peaks = gpuArray(zeros(1,0));
+
+    if data_length < 3
+        return; % Not enough data to find peaks
+    end
+
+    for i = 2:(data_length - 1)
+        if data(i) > data(i-1) && data(i) > data(i+1)
+            % Potential peak
+            is_valid_peak = true;
+
+            % Check minimum peak distance
+            if ~isempty(peakLocations)
+                last_peak_location = peakLocations(end);
+                if i - last_peak_location < minPeakDistance
+                    is_valid_peak = false;
+                end
+            end
+
+            if is_valid_peak
+                peakLocations = [peakLocations, i];
+                peaks = [peaks, data(i)];
+            end
+        end
+    end
+end
+
+function [estimatedFrequencies, confidenceScores, noteIndices] = analyzeHarmonics(estimatedF0, f, P1, A4, A4_INDEX, numNotes, harmonic_indices)
+    % Analyzes harmonics and returns estimated frequencies, confidence scores, and note indices
+
+    numHarmonics = length(harmonic_indices);
+    estimatedFrequencies = gpuArray(zeros(1, numHarmonics));
+    confidenceScores = gpuArray(zeros(1, numHarmonics));
+    noteIndices = gpuArray(zeros(1, numHarmonics));
+
+    for harmonic_idx = 1:numHarmonics
+        harmonic = harmonic_indices(harmonic_idx);
+        harmonicFrequency = estimatedF0 * harmonic;
+        [~, harmonicIndex] = min(abs(f - harmonicFrequency)); % Find the nearest frequency bin
+
+        estimatedFrequency = f(harmonicIndex);
+        estimatedFrequencies(harmonic_idx) = estimatedFrequency;
+        confidenceScores(harmonic_idx) = P1(harmonicIndex); % using spectral magnitude as confidence
+
+        % Map to Note
+        noteIndex = frequencyToNoteIndex(estimatedFrequency, A4, A4_INDEX, numNotes);
+        noteIndices(harmonic_idx) = noteIndex;
+    end
+
+end
